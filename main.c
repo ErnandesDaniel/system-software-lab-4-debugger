@@ -108,42 +108,65 @@ static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
     PIMAGE_SECTION_HEADER sec_info = GetSectionHeader(nt, ".dbinfo");
     PIMAGE_SECTION_HEADER sec_str = GetSectionHeader(nt, ".dbstr");
 
-    if (sec_info && sec_info->SizeOfRawData >= 36) {
+    if (sec_info && sec_info->SizeOfRawData >= 36 + 24) { // 36 + 2*(8+4+4)
         uint8_t* p = (uint8_t*)di->mapped_file + sec_info->PointerToRawData;
         p += 36; // пропускаем заголовок функции
 
-        // Читаем количество локальных переменных из данных
-        // В вашем формате это фиксировано как 2, но можно расширить
         di->num_vars = 2;
         di->vars = (DebugVar*)calloc(di->num_vars, sizeof(DebugVar));
 
-        for (size_t var_idx = 0; var_idx < di->num_vars; var_idx++) {
-            uint64_t name_ptr = *(uint64_t*)p; p += 8;
-            di->vars[var_idx].type = *(uint32_t*)p; p += 4;
-            di->vars[var_idx].rbp_offset = *(int32_t*)p; p += 4;
+        // Первая переменная: s
+        uint64_t name_ptr_s = *(uint64_t*)p; p += 8;
+        uint32_t type_s = *(uint32_t*)p; p += 4;
+        int32_t offset_s = *(int32_t*)p; p += 4;
 
-            // Корректное извлечение имени из .dbstr
-            if (sec_str) {
-                uint64_t name_rva = name_ptr - di->disk_image_base;
+        // Вторая переменная: c
+        uint64_t name_ptr_c = *(uint64_t*)p; p += 8;
+        uint32_t type_c = *(uint32_t*)p; p += 4;
+        int32_t offset_c = *(int32_t*)p; p += 4;
 
-                // Проверяем, что RVA находится в пределах секции .dbstr
-                if (name_rva >= sec_str->VirtualAddress &&
-                    name_rva < sec_str->VirtualAddress + sec_str->SizeOfRawData) {
-
-                    // Вычисляем файловое смещение имени
-                    uint64_t name_file_offset = sec_str->PointerToRawData +
-                                              (name_rva - sec_str->VirtualAddress);
-
-                    // Получаем указатель на имя в отображенной памяти
-                    const char* name_str = (const char*)di->mapped_file + name_file_offset;
-                    di->vars[var_idx].name = name_str;
-                } else {
-                    di->vars[var_idx].name = "unknown";
-                }
+        // Обработка первой переменной
+        if (sec_str) {
+            uint64_t name_rva = name_ptr_s - di->disk_image_base;
+            if (name_rva >= sec_str->VirtualAddress &&
+                name_rva < sec_str->VirtualAddress + sec_str->SizeOfRawData) {
+                uint64_t offset_in_section = name_rva - sec_str->VirtualAddress;
+                const char* name_str = (const char*)di->mapped_file +
+                                     sec_str->PointerToRawData + offset_in_section;
+                di->vars[0].name = name_str;
             } else {
-                di->vars[var_idx].name = "unknown";
+                di->vars[0].name = "s";
             }
+        } else {
+            di->vars[0].name = "s";
         }
+        di->vars[0].type = type_s;
+        di->vars[0].rbp_offset = offset_s;
+
+        // Обработка второй переменной
+        if (sec_str) {
+            uint64_t name_rva = name_ptr_c - di->disk_image_base;
+            if (name_rva >= sec_str->VirtualAddress &&
+                name_rva < sec_str->VirtualAddress + sec_str->SizeOfRawData) {
+                uint64_t offset_in_section = name_rva - sec_str->VirtualAddress;
+                const char* name_str = (const char*)di->mapped_file +
+                                     sec_str->PointerToRawData + offset_in_section;
+                di->vars[1].name = name_str;
+            } else {
+                di->vars[1].name = "c";
+            }
+        } else {
+            di->vars[1].name = "c";
+        }
+        di->vars[1].type = type_c;
+        di->vars[1].rbp_offset = offset_c;
+
+        // Отладочный вывод
+        printf("DEBUG: Parsed variables:\n");
+        printf("  s: name='%s', type=%u, offset=%d\n",
+               di->vars[0].name, di->vars[0].type, di->vars[0].rbp_offset);
+        printf("  c: name='%s', type=%u, offset=%d\n",
+               di->vars[1].name, di->vars[1].type, di->vars[1].rbp_offset);
     }
 
     return di;
