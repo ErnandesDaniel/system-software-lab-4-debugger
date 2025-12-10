@@ -76,12 +76,12 @@ section .rodata
 str_0 db 72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33, 46, 32, 69, 110, 116, 101, 114, 32, 115, 111, 109, 101, 32, 115, 121, 109, 98, 111, 108, 0
 str_1 db 37, 100, 0
 
-section .mydebug_str progbits alloc noexec readonly
+section .dbstr progbits alloc noexec readonly
 dbg_str_main db 'main', 0
 dbg_str_s db 's', 0
 dbg_str_c db 'c', 0
 
-section .mydebug_info progbits alloc noexec readonly
+section .dbinfo progbits alloc noexec readonly
     ; === Функция main ===
     dq dbg_str_main                 ; указатель на имя
     dq main                         ; старт
@@ -97,7 +97,7 @@ section .mydebug_info progbits alloc noexec readonly
     dd 0                            ; тип: int
     dd -56                           ; смещение
 
-section .mymydebug_line progbits alloc noexec readonly
+section .dbline progbits alloc noexec readonly
 dq line_16
 dd 16
 dq line_18

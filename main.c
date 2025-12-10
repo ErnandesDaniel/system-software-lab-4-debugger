@@ -32,6 +32,7 @@ typedef struct {
 
 // ========== ОБЪЯВЛЕНИЯ ФУНКЦИЙ ==========
 
+static PIMAGE_SECTION_HEADER GetSectionHeader(PIMAGE_NT_HEADERS nt, const char* name);
 static DebugInfo* ParseDebugInfoFromFile(const char* exe_path);
 static void FreeDebugInfo(DebugInfo* di);
 static void ResolveRuntimeAddresses(DebugInfo* di, uint64_t runtime_base);
@@ -41,11 +42,45 @@ static uint64_t FindNextLine(DebugInfo* di, uint64_t current_rip);
 
 // ========== РЕАЛИЗАЦИЯ ==========
 
+
 static PIMAGE_SECTION_HEADER GetSectionHeader(PIMAGE_NT_HEADERS nt, const char* name) {
     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    printf("DEBUG: Looking for section '%s'\n", name);
+
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        if (strncmp((char*)sec->Name, name, IMAGE_SIZEOF_SHORT_NAME) == 0)
+        char sec_name[IMAGE_SIZEOF_SHORT_NAME + 1] = {0};
+        memcpy(sec_name, sec->Name, IMAGE_SIZEOF_SHORT_NAME);
+        printf("DEBUG: Section %d: '%s' (raw: ", i, sec_name);
+        for (int j = 0; j < IMAGE_SIZEOF_SHORT_NAME; j++) {
+            if (sec->Name[j] >= 32 && sec->Name[j] <= 126) {
+                printf("%c", sec->Name[j]);
+            } else {
+                printf("\\x%02x", (unsigned char)sec->Name[j]);
+            }
+        }
+        printf(")\n");
+
+        if (strncmp((char*)sec->Name, name, IMAGE_SIZEOF_SHORT_NAME) == 0) {
+            printf("DEBUG: FOUND section '%s'!\n", name);
             return sec;
+        }
+    }
+    printf("DEBUG: Section '%s' NOT FOUND!\n", name);
+    return NULL;
+}
+
+
+
+static PIMAGE_SECTION_HEADER FindSectionByPrefix(PIMAGE_NT_HEADERS nt, const char* prefix) {
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    size_t prefix_len = strlen(prefix);
+    if (prefix_len > IMAGE_SIZEOF_SHORT_NAME) {
+        prefix_len = IMAGE_SIZEOF_SHORT_NAME;
+    }
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (strncmp((char*)sec->Name, prefix, prefix_len) == 0) {
+            return sec;
+        }
     }
     return NULL;
 }
@@ -72,7 +107,7 @@ static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
     di->disk_image_base = nt->OptionalHeader.ImageBase;
 
     // --- .debug_line ---
-    PIMAGE_SECTION_HEADER sec_line = GetSectionHeader(nt, ".mydebug_line");
+    PIMAGE_SECTION_HEADER sec_line = GetSectionHeader(nt, ".dbline");
     if (sec_line && sec_line->SizeOfRawData > 0) {
         uint8_t* p = (uint8_t*)di->mapped_file + sec_line->PointerToRawData;
         size_t size = sec_line->SizeOfRawData;
@@ -86,8 +121,8 @@ static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
     }
 
     // --- .debug_info (ожидаем 2 переменные) ---
-    PIMAGE_SECTION_HEADER sec_info = GetSectionHeader(nt, ".mydebug_info");
-    PIMAGE_SECTION_HEADER sec_str = GetSectionHeader(nt, ".mydebug_str");
+    PIMAGE_SECTION_HEADER sec_info = GetSectionHeader(nt, ".dbinfo");
+    PIMAGE_SECTION_HEADER sec_str = GetSectionHeader(nt, ".dbstr");
     const char* str_base = NULL;
     if (sec_str) {
         str_base = (const char*)di->mapped_file + sec_str->PointerToRawData;
