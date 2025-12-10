@@ -110,13 +110,33 @@ static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
     PIMAGE_SECTION_HEADER sec_line = GetSectionHeader(nt, ".dbline");
     if (sec_line && sec_line->SizeOfRawData > 0) {
         uint8_t* p = (uint8_t*)di->mapped_file + sec_line->PointerToRawData;
-        size_t size = sec_line->SizeOfRawData;
-        di->num_lines = size / (sizeof(uint64_t) + sizeof(uint32_t));
-        di->lines = (DebugLineEntry*)calloc(di->num_lines, sizeof(DebugLineEntry));
+        size_t max_records = sec_line->SizeOfRawData / 12;
 
-        for (size_t i = 0; i < di->num_lines && (p + 12 <= (uint8_t*)di->mapped_file + sec_line->PointerToRawData + sec_line->SizeOfRawData); i++) {
-            di->lines[i].va_on_disk = *(uint64_t*)p; p += 8;
-            di->lines[i].line_number = *(uint32_t*)p; p += 4;
+        // Подсчитываем реальное количество записей (до маркера конца)
+        size_t actual_count = 0;
+        for (size_t i = 0; i < max_records; i++) {
+            if (p + 12 > (uint8_t*)di->mapped_file + sec_line->PointerToRawData + sec_line->SizeOfRawData) {
+                break;
+            }
+            uint64_t va = *(uint64_t*)p;
+            uint32_t line = *(uint32_t*)(p + 8);
+            if (va == 0 && line == 0) {
+                break; // достигли маркера конца
+            }
+            actual_count++;
+            p += 12;
+        }
+
+        // Теперь выделяем память и читаем только реальные записи
+        if (actual_count > 0) {
+            di->num_lines = actual_count;
+            di->lines = (DebugLineEntry*)calloc(di->num_lines, sizeof(DebugLineEntry));
+
+            p = (uint8_t*)di->mapped_file + sec_line->PointerToRawData;
+            for (size_t i = 0; i < di->num_lines; i++) {
+                di->lines[i].va_on_disk = *(uint64_t*)p; p += 8;
+                di->lines[i].line_number = *(uint32_t*)p; p += 4;
+            }
         }
     }
 
