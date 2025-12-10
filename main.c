@@ -42,45 +42,11 @@ static uint64_t FindNextLine(DebugInfo* di, uint64_t current_rip);
 
 // ========== РЕАЛИЗАЦИЯ ==========
 
-
 static PIMAGE_SECTION_HEADER GetSectionHeader(PIMAGE_NT_HEADERS nt, const char* name) {
     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-    printf("DEBUG: Looking for section '%s'\n", name);
-
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        char sec_name[IMAGE_SIZEOF_SHORT_NAME + 1] = {0};
-        memcpy(sec_name, sec->Name, IMAGE_SIZEOF_SHORT_NAME);
-        printf("DEBUG: Section %d: '%s' (raw: ", i, sec_name);
-        for (int j = 0; j < IMAGE_SIZEOF_SHORT_NAME; j++) {
-            if (sec->Name[j] >= 32 && sec->Name[j] <= 126) {
-                printf("%c", sec->Name[j]);
-            } else {
-                printf("\\x%02x", (unsigned char)sec->Name[j]);
-            }
-        }
-        printf(")\n");
-
-        if (strncmp((char*)sec->Name, name, IMAGE_SIZEOF_SHORT_NAME) == 0) {
-            printf("DEBUG: FOUND section '%s'!\n", name);
+        if (strncmp((char*)sec->Name, name, IMAGE_SIZEOF_SHORT_NAME) == 0)
             return sec;
-        }
-    }
-    printf("DEBUG: Section '%s' NOT FOUND!\n", name);
-    return NULL;
-}
-
-
-
-static PIMAGE_SECTION_HEADER FindSectionByPrefix(PIMAGE_NT_HEADERS nt, const char* prefix) {
-    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-    size_t prefix_len = strlen(prefix);
-    if (prefix_len > IMAGE_SIZEOF_SHORT_NAME) {
-        prefix_len = IMAGE_SIZEOF_SHORT_NAME;
-    }
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        if (strncmp((char*)sec->Name, prefix, prefix_len) == 0) {
-            return sec;
-        }
     }
     return NULL;
 }
@@ -106,13 +72,12 @@ static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
 
     di->disk_image_base = nt->OptionalHeader.ImageBase;
 
-    // --- .debug_line ---
+    // --- .dbline ---
     PIMAGE_SECTION_HEADER sec_line = GetSectionHeader(nt, ".dbline");
     if (sec_line && sec_line->SizeOfRawData > 0) {
         uint8_t* p = (uint8_t*)di->mapped_file + sec_line->PointerToRawData;
         size_t max_records = sec_line->SizeOfRawData / 12;
 
-        // Подсчитываем реальное количество записей (до маркера конца)
         size_t actual_count = 0;
         for (size_t i = 0; i < max_records; i++) {
             if (p + 12 > (uint8_t*)di->mapped_file + sec_line->PointerToRawData + sec_line->SizeOfRawData) {
@@ -121,13 +86,12 @@ static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
             uint64_t va = *(uint64_t*)p;
             uint32_t line = *(uint32_t*)(p + 8);
             if (va == 0 && line == 0) {
-                break; // достигли маркера конца
+                break;
             }
             actual_count++;
             p += 12;
         }
 
-        // Теперь выделяем память и читаем только реальные записи
         if (actual_count > 0) {
             di->num_lines = actual_count;
             di->lines = (DebugLineEntry*)calloc(di->num_lines, sizeof(DebugLineEntry));
@@ -140,51 +104,45 @@ static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
         }
     }
 
-    // --- .debug_info (ожидаем 2 переменные) ---
+    // --- .dbinfo ---
     PIMAGE_SECTION_HEADER sec_info = GetSectionHeader(nt, ".dbinfo");
     PIMAGE_SECTION_HEADER sec_str = GetSectionHeader(nt, ".dbstr");
-    const char* str_base = NULL;
-    if (sec_str) {
-        str_base = (const char*)di->mapped_file + sec_str->PointerToRawData;
-    }
 
-    if (sec_info && sec_info->SizeOfRawData >= 36 + 24) { // 36 + 2*(8+4+4)
+    if (sec_info && sec_info->SizeOfRawData >= 36) {
         uint8_t* p = (uint8_t*)di->mapped_file + sec_info->PointerToRawData;
         p += 36; // пропускаем заголовок функции
 
+        // Читаем количество локальных переменных из данных
+        // В вашем формате это фиксировано как 2, но можно расширить
         di->num_vars = 2;
         di->vars = (DebugVar*)calloc(di->num_vars, sizeof(DebugVar));
 
-        // Первая переменная
-        uint64_t name_ptr = *(uint64_t*)p; p += 8;
-        di->vars[0].type = *(uint32_t*)p; p += 4;
-        di->vars[0].rbp_offset = *(int32_t*)p; p += 4;
-        if (str_base && sec_str) {
-            uint64_t name_rva = name_ptr - di->disk_image_base;
-            size_t name_offset = (size_t)(name_rva - sec_str->VirtualAddress);
-            if (name_offset < sec_str->SizeOfRawData) {
-                di->vars[0].name = str_base + name_offset;
-            } else {
-                di->vars[0].name = "s";
-            }
-        } else {
-            di->vars[0].name = "s";
-        }
+        for (size_t var_idx = 0; var_idx < di->num_vars; var_idx++) {
+            uint64_t name_ptr = *(uint64_t*)p; p += 8;
+            di->vars[var_idx].type = *(uint32_t*)p; p += 4;
+            di->vars[var_idx].rbp_offset = *(int32_t*)p; p += 4;
 
-        // Вторая переменная
-        name_ptr = *(uint64_t*)p; p += 8;
-        di->vars[1].type = *(uint32_t*)p; p += 4;
-        di->vars[1].rbp_offset = *(int32_t*)p; p += 4;
-        if (str_base && sec_str) {
-            uint64_t name_rva = name_ptr - di->disk_image_base;
-            size_t name_offset = (size_t)(name_rva - sec_str->VirtualAddress);
-            if (name_offset < sec_str->SizeOfRawData) {
-                di->vars[1].name = str_base + name_offset;
+            // Корректное извлечение имени из .dbstr
+            if (sec_str) {
+                uint64_t name_rva = name_ptr - di->disk_image_base;
+
+                // Проверяем, что RVA находится в пределах секции .dbstr
+                if (name_rva >= sec_str->VirtualAddress &&
+                    name_rva < sec_str->VirtualAddress + sec_str->SizeOfRawData) {
+
+                    // Вычисляем файловое смещение имени
+                    uint64_t name_file_offset = sec_str->PointerToRawData +
+                                              (name_rva - sec_str->VirtualAddress);
+
+                    // Получаем указатель на имя в отображенной памяти
+                    const char* name_str = (const char*)di->mapped_file + name_file_offset;
+                    di->vars[var_idx].name = name_str;
+                } else {
+                    di->vars[var_idx].name = "unknown";
+                }
             } else {
-                di->vars[1].name = "c";
+                di->vars[var_idx].name = "unknown";
             }
-        } else {
-            di->vars[1].name = "c";
         }
     }
 
@@ -343,7 +301,7 @@ int main(int argc, char* argv[]) {
                 if (code == EXCEPTION_BREAKPOINT) {
                     if (!hit_initial_break) {
                         hit_initial_break = TRUE;
-                        break; // skip initial breakpoint
+                        break;
                     }
 
                     int current_line = -1;
