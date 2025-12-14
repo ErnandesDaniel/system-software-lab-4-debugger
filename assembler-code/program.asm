@@ -11,6 +11,7 @@ extern printf
 ; Первая метка в .text — для вычисления смещений
 .text_start:
 main:
+    int3
     push rbp
     mov rbp, rsp
     sub rsp, 168

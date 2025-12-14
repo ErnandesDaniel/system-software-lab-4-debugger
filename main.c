@@ -4,38 +4,25 @@
 #include <stdint.h>
 #include <string.h>
 
-// Структуры для парсинга
 typedef struct {
-    uint32_t offset;  // смещение от начала .text
-    uint32_t line;
-} DbLineEntry;
-
-typedef struct {
-    const char* name;
-    uint32_t type;      // 0 = int, 1 = string
-    int32_t rbp_offset;
-} DbVar;
+    uint32_t offset;     // смещение от начала .text
+    uint32_t src_line;   // номер строки в исходном коде
+} DbgLine;
 
 // Глобальные
 HANDLE hProcess = NULL;
 HANDLE hThread = NULL;
 uint64_t image_base = 0;
 uint64_t text_rva = 0;
-uint64_t breakpoint_va = 0;
+uint64_t target_breakpoint_va = 0;
 BYTE original_byte = 0;
-DbVar locals[10];
-int num_locals = 0;
-char* dbstr_data = NULL;
-size_t dbstr_size = 0;
+uint32_t target_offset = 0;
+uint32_t target_line = 0;
+BOOL first_breakpoint = TRUE;
 
 // Прототипы
 BOOL ReadSection(const char* filename, const char* name, void** data, DWORD* size);
 uint64_t GetSectionRVA(const char* filename, const char* name);
-void ParseDbInfo(const char* filename);
-void ParseDbLineAndList(const char* filename);
-BOOL SetBreakpoint(uint64_t va);
-BOOL RemoveBreakpoint(uint64_t va);
-void DebugLoop(uint64_t target_rva);
 
 // =================================================
 //                     main()
@@ -48,21 +35,185 @@ int main(int argc, char* argv[]) {
 
     const char* exe = argv[1];
 
-    // Найдём RVA секции .text
+    // --- 1. Получаем RVA секции .text ---
     text_rva = GetSectionRVA(exe, ".text");
     if (text_rva == 0) {
         printf("[-] Cannot find .text RVA\n");
         return 1;
     }
 
-    // Загрузим имена переменных из .dbstr
-    ReadSection(exe, ".dbstr", (void**)&dbstr_data, (DWORD*)&dbstr_size);
+    // --- 2. Читаем .dbline ---
+    void* dbline_data = NULL;
+    DWORD dbline_size = 0;
+    if (!ReadSection(exe, ".dbline", &dbline_data, &dbline_size)) {
+        printf("[-] Cannot read .dbline\n");
+        return 1;
+    }
 
-    // Прочитаем информацию о переменных
-    ParseDbInfo(exe);
+    // --- 3. Показываем строки ---
+    printf("=== Available source lines ===\n");
+    DbgLine* lines = (DbgLine*)dbline_data;
+    int count = 0;
+    while (lines[count].src_line != 0) {
+        printf("  %d: line %u\n", count + 1, lines[count].src_line);
+        count++;
+    }
 
-    // Покажем доступные строки и дадим выбрать
-    ParseDbLineAndList(exe);
+    if (count == 0) {
+        printf("No source lines found.\n");
+        free(dbline_data);
+        return 1;
+    }
+
+    // --- 4. Выбор строки ---
+    printf("\nChoose source line to break at: ");
+    if (scanf("%u", &target_line) != 1) {
+        printf("Invalid input.\n");
+        free(dbline_data);
+        return 1;
+    }
+
+    target_offset = 0;
+    for (int i = 0; i < count; i++) {
+        if (lines[i].src_line == target_line) {
+            target_offset = lines[i].offset;
+            break;
+        }
+    }
+    free(dbline_data);
+
+    if (target_offset == 0) {
+        printf("Line %u not found.\n", target_line);
+        return 1;
+    }
+
+    printf("[*] Will break at source line %u (offset 0x%x from .text)\n", target_line, target_offset);
+
+    // --- 5. Запуск процесса ---
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    if (!CreateProcessA(exe, NULL, NULL, NULL, FALSE,
+                        DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS,
+                        NULL, NULL, &si, &pi)) {
+        printf("CreateProcess failed (%lu)\n", GetLastError());
+        return 1;
+    }
+
+    hProcess = pi.hProcess;
+    hThread = pi.hThread;
+
+    // --- 6. Отладочный цикл ---
+    DEBUG_EVENT de;
+    while (WaitForDebugEvent(&de, INFINITE)) {
+        if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+            image_base = (uint64_t)de.u.CreateProcessInfo.lpBaseOfImage;
+            printf("[*] Image base = 0x%llx\n", image_base);
+            target_breakpoint_va = image_base + text_rva + target_offset;
+        }
+
+        if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+            if (de.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT) {
+                if (first_breakpoint) {
+                    // Это int3 в начале main
+                    printf("[*] Hit initial breakpoint in main\n");
+                    first_breakpoint = FALSE;
+
+                    // Устанавливаем breakpoint по выбранной строке
+                    if (ReadProcessMemory(hProcess, (void*)target_breakpoint_va, &original_byte, 1, NULL)) {
+                        BYTE int3 = 0xCC;
+                        if (WriteProcessMemory(hProcess, (void*)target_breakpoint_va, &int3, 1, NULL)) {
+                            printf("[*] Breakpoint set at VA 0x%llx\n", target_breakpoint_va);
+                        } else {
+                            printf("[-] Failed to write breakpoint\n");
+                        }
+                    } else {
+                        printf("[-] Failed to read original byte at target\n");
+                    }
+
+                    // Продолжаем выполнение (первый int3 пропускаем)
+                    ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+                } else {
+                    // Это наш целевой breakpoint
+                    CONTEXT ctx;
+                    ctx.ContextFlags = CONTEXT_FULL;
+                    if (GetThreadContext(hThread, &ctx)) {
+                        printf("\n[!] HIT BREAKPOINT at source line %u\n", target_line);
+                        printf("RBP = 0x%llx\n", ctx.Rbp);
+
+                        // Читаем .dbstr и .dbinfo
+                        void* dbstr_data = NULL, *dbinfo_data = NULL;
+                        DWORD dbstr_size = 0, dbinfo_size = 0;
+                        ReadSection(exe, ".dbstr", &dbstr_data, &dbstr_size);
+                        ReadSection(exe, ".dbinfo", &dbinfo_data, &dbinfo_size);
+
+                        if (dbinfo_data && dbinfo_size >= 24) {
+                            uint8_t* p = (uint8_t*)dbinfo_data;
+                            p += 8; // пропустить имя функции
+                            p += 8; // пропустить params (4) + locals (4)
+
+                            // Переменная s
+                            uint64_t name_off = *(uint64_t*)p; p += 8;
+                            uint32_t type = *(uint32_t*)p; p += 4;
+                            int32_t offset = *(int32_t*)p; p += 4;
+
+                            const char* name = "s";
+                            if (dbstr_data && name_off < dbstr_size) {
+                                name = (const char*)((uint8_t*)dbstr_data + name_off);
+                            }
+
+                            if (type == 1) { // string
+                                char* ptr = NULL;
+                                ReadProcessMemory(hProcess, (void*)(ctx.Rbp + offset), &ptr, 8, NULL);
+                                if (ptr) {
+                                    char buf[256] = {0};
+                                    ReadProcessMemory(hProcess, ptr, buf, 255, NULL);
+                                    printf("    %s = \"%s\"\n", name, buf);
+                                }
+                            }
+
+                            // Переменная c
+                            name_off = *(uint64_t*)p; p += 8;
+                            type = *(uint32_t*)p; p += 4;
+                            offset = *(int32_t*)p; p += 4;
+
+                            name = "c";
+                            if (dbstr_data && name_off < dbstr_size) {
+                                name = (const char*)((uint8_t*)dbstr_data + name_off);
+                            }
+
+                            if (type == 0) { // int
+                                int val = 0;
+                                ReadProcessMemory(hProcess, (void*)(ctx.Rbp + offset), &val, 4, NULL);
+                                printf("    %s = %d\n", name, val);
+                            }
+                        }
+
+                        if (dbstr_data) free(dbstr_data);
+                        if (dbinfo_data) free(dbinfo_data);
+
+                        printf("\n[!] Press Enter to continue...\n");
+                        getchar();
+
+                        // Восстанавливаем оригинальную инструкцию
+                        WriteProcessMemory(hProcess, (void*)target_breakpoint_va, &original_byte, 1, NULL);
+                        // Корректируем RIP, чтобы выполнить её
+                        ctx.Rip = target_breakpoint_va;
+                        SetThreadContext(hThread, &ctx);
+                    }
+
+                    ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+                }
+            } else {
+                ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+            }
+        } else if (de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+            printf("\n[*] Process exited (code: %lu)\n", de.u.ExitProcess.dwExitCode);
+            break;
+        } else {
+            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+        }
+    }
 
     return 0;
 }
@@ -76,17 +227,19 @@ BOOL ReadSection(const char* filename, const char* name, void** data, DWORD* siz
     if (!f) return FALSE;
 
     IMAGE_DOS_HEADER dos;
-    fread(&dos, sizeof(dos), 1, f);
-    if (dos.e_magic != IMAGE_DOS_SIGNATURE) { fclose(f); return FALSE; }
+    if (fread(&dos, sizeof(dos), 1, f) != 1 || dos.e_magic != 0x5A4D) {
+        fclose(f); return FALSE;
+    }
 
     fseek(f, dos.e_lfanew, SEEK_SET);
     IMAGE_NT_HEADERS64 nt;
-    fread(&nt, sizeof(nt), 1, f);
-    if (nt.Signature != IMAGE_NT_SIGNATURE) { fclose(f); return FALSE; }
+    if (fread(&nt, sizeof(nt), 1, f) != 1 || nt.Signature != 0x4550) {
+        fclose(f); return FALSE;
+    }
 
     for (int i = 0; i < nt.FileHeader.NumberOfSections; ++i) {
         IMAGE_SECTION_HEADER sec;
-        fread(&sec, sizeof(sec), 1, f);
+        if (fread(&sec, sizeof(sec), 1, f) != 1) break;
         if (strncmp((char*)sec.Name, name, 8) == 0) {
             *size = sec.SizeOfRawData ? sec.SizeOfRawData : sec.Misc.VirtualSize;
             *data = malloc(*size);
@@ -105,17 +258,19 @@ uint64_t GetSectionRVA(const char* filename, const char* name) {
     if (!f) return 0;
 
     IMAGE_DOS_HEADER dos;
-    fread(&dos, sizeof(dos), 1, f);
-    if (dos.e_magic != IMAGE_DOS_SIGNATURE) { fclose(f); return 0; }
+    if (fread(&dos, sizeof(dos), 1, f) != 1 || dos.e_magic != 0x5A4D) {
+        fclose(f); return 0;
+    }
 
     fseek(f, dos.e_lfanew, SEEK_SET);
     IMAGE_NT_HEADERS64 nt;
-    fread(&nt, sizeof(nt), 1, f);
-    if (nt.Signature != IMAGE_NT_SIGNATURE) { fclose(f); return 0; }
+    if (fread(&nt, sizeof(nt), 1, f) != 1 || nt.Signature != 0x4550) {
+        fclose(f); return 0;
+    }
 
     for (int i = 0; i < nt.FileHeader.NumberOfSections; ++i) {
         IMAGE_SECTION_HEADER sec;
-        fread(&sec, sizeof(sec), 1, f);
+        if (fread(&sec, sizeof(sec), 1, f) != 1) break;
         if (strncmp((char*)sec.Name, name, 8) == 0) {
             fclose(f);
             return sec.VirtualAddress;
@@ -123,159 +278,4 @@ uint64_t GetSectionRVA(const char* filename, const char* name) {
     }
     fclose(f);
     return 0;
-}
-
-void ParseDbInfo(const char* filename) {
-    void* data; DWORD size;
-    if (!ReadSection(filename, ".dbinfo", &data, &size)) return;
-
-    uint8_t* p = (uint8_t*)data;
-    p += 8; // пропустить имя функции (8 байт)
-    uint32_t params = *(uint32_t*)p; p += 4;
-    num_locals = *(uint32_t*)p; p += 4;
-
-    if (num_locals > 10) num_locals = 10;
-
-    for (int i = 0; i < num_locals; ++i) {
-        uint64_t name_off = *(uint64_t*)p; p += 8;
-        locals[i].type = *(uint32_t*)p; p += 4;
-        locals[i].rbp_offset = *(int32_t*)p; p += 4;
-        locals[i].name = (dbstr_data && name_off < dbstr_size) ? (dbstr_data + name_off) : "unknown";
-    }
-
-    free(data);
-}
-
-void ParseDbLineAndList(const char* filename) {
-    void* data; DWORD size;
-    if (!ReadSection(filename, ".dbline", &data, &size)) {
-        printf("[-] No .dbline found\n");
-        return;
-    }
-
-    printf("\n=== Available breakpoints ===\n");
-    DbLineEntry* entries = (DbLineEntry*)data;
-    int count = 0;
-    while (entries[count].offset != 0 || entries[count].line != 0) {
-        uint64_t rva = text_rva + entries[count].offset;
-        printf("  %d: line %u (RVA 0x%llx)\n", count + 1, entries[count].line, rva);
-        count++;
-    }
-
-    if (count == 0) {
-        printf("  No breakpoints available.\n");
-        free(data);
-        return;
-    }
-
-    printf("\nChoose line number to break at (1-%d): ", count);
-    int choice;
-    if (scanf("%d", &choice) != 1 || choice < 1 || choice > count) {
-        printf("Invalid choice.\n");
-        free(data);
-        return;
-    }
-
-    uint64_t target_rva = text_rva + entries[choice - 1].offset;
-    free(data);
-
-    // Запускаем процесс и отлаживаем
-    STARTUPINFOA si = {0};
-    PROCESS_INFORMATION pi = {0};
-    si.cb = sizeof(si);
-
-    if (!CreateProcessA(filename, NULL, NULL, NULL, FALSE,
-                        DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS,
-                        NULL, NULL, &si, &pi)) {
-        printf("CreateProcess failed\n");
-        return;
-    }
-
-    hProcess = pi.hProcess;
-    hThread = pi.hThread;
-    image_base = (uint64_t) /* получим ниже */ 0;
-
-    // Запускаем отладочный цикл
-    DebugLoop(target_rva);
-}
-
-BOOL SetBreakpoint(uint64_t va) {
-    if (!ReadProcessMemory(hProcess, (void*)va, &original_byte, 1, NULL)) return FALSE;
-    BYTE int3 = 0xCC;
-    return WriteProcessMemory(hProcess, (void*)va, &int3, 1, NULL);
-}
-
-BOOL RemoveBreakpoint(uint64_t va) {
-    return WriteProcessMemory(hProcess, (void*)va, &original_byte, 1, NULL);
-}
-
-void DebugLoop(uint64_t target_rva) {
-    DEBUG_EVENT de;
-    BOOL hit = FALSE;
-
-    while (WaitForDebugEvent(&de, INFINITE)) {
-        if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
-            image_base = (uint64_t)de.u.CreateProcessInfo.lpBaseOfImage;
-            breakpoint_va = image_base + target_rva;
-            printf("\n[*] Process loaded. Image base = 0x%llx\n", image_base);
-            printf("[*] Setting breakpoint at VA = 0x%llx\n", breakpoint_va);
-            if (!SetBreakpoint(breakpoint_va)) {
-                printf("[-] Failed to set breakpoint\n");
-                break;
-            }
-        }
-
-        if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-            if (de.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT) {
-                CONTEXT ctx;
-                ctx.ContextFlags = CONTEXT_FULL;
-                if (GetThreadContext(hThread, &ctx)) {
-                    if (ctx.Rip == breakpoint_va + 1) { // после int3
-                        printf("\n[!] HIT BREAKPOINT\n");
-                        RemoveBreakpoint(breakpoint_va);
-                        ctx.Rip = breakpoint_va;
-                        SetThreadContext(hThread, &ctx);
-
-                        // Single-step
-                        ctx.ContextFlags = CONTEXT_FULL;
-                        ctx.EFlags |= 0x100;
-                        SetThreadContext(hThread, &ctx);
-                        hit = TRUE;
-                    } else if (hit && de.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP) {
-                        GetThreadContext(hThread, &ctx);
-                        uint64_t rbp = ctx.Rbp;
-
-                        printf("\n>>> Local variables:\n");
-                        for (int i = 0; i < num_locals; ++i) {
-                            if (locals[i].type == 0) { // int
-                                int val;
-                                if (ReadProcessMemory(hProcess, (void*)(rbp + locals[i].rbp_offset), &val, sizeof(val), NULL)) {
-                                    printf("    %s = %d\n", locals[i].name, val);
-                                }
-                            } else if (locals[i].type == 1) { // string
-                                char* ptr;
-                                if (ReadProcessMemory(hProcess, (void*)(rbp + locals[i].rbp_offset), &ptr, sizeof(ptr), NULL) && ptr) {
-                                    char buf[256] = {0};
-                                    if (ReadProcessMemory(hProcess, ptr, buf, sizeof(buf) - 1, NULL)) {
-                                        printf("    %s = \"%s\"\n", locals[i].name, buf);
-                                    }
-                                }
-                            }
-                        }
-
-                        printf("\n[!] Press Enter to continue execution...\n");
-                        getchar();
-                        hit = FALSE;
-                    }
-                }
-            }
-        }
-
-        if (de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
-            printf("\n[*] Process exited (code: %lu)\n", de.u.ExitProcess.dwExitCode);
-            break;
-        }
-
-        ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
-    }
 }
