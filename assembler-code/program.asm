@@ -8,6 +8,8 @@ extern getchar
 extern putchar
 extern printf
 
+; Первая метка в .text — для вычисления смещений
+.text_start:
 main:
     push rbp
     mov rbp, rsp
@@ -83,11 +85,9 @@ dbg_str_c db 'c', 0
 
 section .dbinfo progbits alloc noexec readonly
     ; === Функция main ===
-    dq dbg_str_main                 ; указатель на имя
-    dq main                         ; старт
-    dq main_end                     ; конец
-    dd 0                          ; параметров: 0
-    dd 2                         ; локальных: 2
+    dq dbg_str_main ; указатель на имя
+    dd 0          ; params
+    dd 2          ; locals
     ; Переменная s
     dq dbg_str_s                    ; имя
     dd 1                            ; тип: string
@@ -98,20 +98,11 @@ section .dbinfo progbits alloc noexec readonly
     dd -56                           ; смещение
 
 section .dbline progbits alloc noexec readonly
-dq line_16
-dd 16
-dq line_18
-dd 18
-dq line_20
-dd 20
-dq line_21
-dd 21
-dq line_22
-dd 22
-dq line_24
-dd 24
-dq line_26
-dd 26
-; Маркер конца: нулевой адрес
-dq 0
-dd 0
+    dd line_16 - .text_start, 16
+    dd line_18 - .text_start, 18
+    dd line_20 - .text_start, 20
+    dd line_21 - .text_start, 21
+    dd line_22 - .text_start, 22
+    dd line_24 - .text_start, 24
+    dd line_26 - .text_start, 26
+    dd 0, 0       ; конец

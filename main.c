@@ -1,402 +1,281 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
+#include <string.h>
 
-// ========== СТРУКТУРЫ ==========
-
+// Структуры для парсинга
 typedef struct {
-    uint64_t va_on_disk;   // VA метки в EXE на диске
-    int line_number;
-    uint64_t runtime_va;   // VA в памяти при запуске
-} DebugLineEntry;
+    uint32_t offset;  // смещение от начала .text
+    uint32_t line;
+} DbLineEntry;
 
 typedef struct {
     const char* name;
-    int type;              // 0 = int, 1 = string (указатель)
+    uint32_t type;      // 0 = int, 1 = string
     int32_t rbp_offset;
-} DebugVar;
+} DbVar;
 
-typedef struct {
-    uint64_t disk_image_base;
-    DebugLineEntry* lines;
-    size_t num_lines;
-    DebugVar* vars;
-    size_t num_vars;
-    LPVOID mapped_file;
-    HANDLE hFileMap;
-    HANDLE hFile;
-} DebugInfo;
+// Глобальные
+HANDLE hProcess = NULL;
+HANDLE hThread = NULL;
+uint64_t image_base = 0;
+uint64_t text_rva = 0;
+uint64_t breakpoint_va = 0;
+BYTE original_byte = 0;
+DbVar locals[10];
+int num_locals = 0;
+char* dbstr_data = NULL;
+size_t dbstr_size = 0;
 
-// ========== ОБЪЯВЛЕНИЯ ФУНКЦИЙ ==========
+// Прототипы
+BOOL ReadSection(const char* filename, const char* name, void** data, DWORD* size);
+uint64_t GetSectionRVA(const char* filename, const char* name);
+void ParseDbInfo(const char* filename);
+void ParseDbLineAndList(const char* filename);
+BOOL SetBreakpoint(uint64_t va);
+BOOL RemoveBreakpoint(uint64_t va);
+void DebugLoop(uint64_t target_rva);
 
-static PIMAGE_SECTION_HEADER GetSectionHeader(PIMAGE_NT_HEADERS nt, const char* name);
-static DebugInfo* ParseDebugInfoFromFile(const char* exe_path);
-static void FreeDebugInfo(DebugInfo* di);
-static void ResolveRuntimeAddresses(DebugInfo* di, uint64_t runtime_base);
-static BOOL SetBreakpoint(HANDLE hProcess, uint64_t va);
-static void ReadVariable(HANDLE hProcess, DebugInfo* di, const char* var_name, uint64_t rbp);
-static uint64_t FindNextLine(DebugInfo* di, uint64_t current_rip);
-
-// ========== РЕАЛИЗАЦИЯ ==========
-
-static PIMAGE_SECTION_HEADER GetSectionHeader(PIMAGE_NT_HEADERS nt, const char* name) {
-    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        if (strncmp((char*)sec->Name, name, IMAGE_SIZEOF_SHORT_NAME) == 0)
-            return sec;
-    }
-    return NULL;
-}
-
-static DebugInfo* ParseDebugInfoFromFile(const char* exe_path) {
-    DebugInfo* di = (DebugInfo*)calloc(1, sizeof(DebugInfo));
-    if (!di) return NULL;
-
-    di->hFile = CreateFileA(exe_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (di->hFile == INVALID_HANDLE_VALUE) goto fail;
-
-    di->hFileMap = CreateFileMappingA(di->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!di->hFileMap) goto fail;
-
-    di->mapped_file = MapViewOfFile(di->hFileMap, FILE_MAP_READ, 0, 0, 0);
-    if (!di->mapped_file) goto fail;
-
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)di->mapped_file;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) goto fail;
-
-    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)di->mapped_file + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) goto fail;
-
-    di->disk_image_base = nt->OptionalHeader.ImageBase;
-
-    // --- .dbline ---
-    PIMAGE_SECTION_HEADER sec_line = GetSectionHeader(nt, ".dbline");
-    if (sec_line && sec_line->SizeOfRawData > 0) {
-        uint8_t* p = (uint8_t*)di->mapped_file + sec_line->PointerToRawData;
-        size_t max_records = sec_line->SizeOfRawData / 12;
-
-        size_t actual_count = 0;
-        for (size_t i = 0; i < max_records; i++) {
-            if (p + 12 > (uint8_t*)di->mapped_file + sec_line->PointerToRawData + sec_line->SizeOfRawData) {
-                break;
-            }
-            uint64_t va = *(uint64_t*)p;
-            uint32_t line = *(uint32_t*)(p + 8);
-            if (va == 0 && line == 0) {
-                break;
-            }
-            actual_count++;
-            p += 12;
-        }
-
-        if (actual_count > 0) {
-            di->num_lines = actual_count;
-            di->lines = (DebugLineEntry*)calloc(di->num_lines, sizeof(DebugLineEntry));
-
-            p = (uint8_t*)di->mapped_file + sec_line->PointerToRawData;
-            for (size_t i = 0; i < di->num_lines; i++) {
-                di->lines[i].va_on_disk = *(uint64_t*)p; p += 8;
-                di->lines[i].line_number = *(uint32_t*)p; p += 4;
-            }
-        }
+// =================================================
+//                     main()
+// =================================================
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        printf("Usage: debugger <exe_file>\n");
+        return 1;
     }
 
-    // --- .dbinfo ---
-    PIMAGE_SECTION_HEADER sec_info = GetSectionHeader(nt, ".dbinfo");
-    PIMAGE_SECTION_HEADER sec_str = GetSectionHeader(nt, ".dbstr");
+    const char* exe = argv[1];
 
-    if (sec_info && sec_info->SizeOfRawData >= 36 + 24) { // 36 + 2*(8+4+4)
-        uint8_t* p = (uint8_t*)di->mapped_file + sec_info->PointerToRawData;
-        p += 36; // пропускаем заголовок функции
-
-        di->num_vars = 2;
-        di->vars = (DebugVar*)calloc(di->num_vars, sizeof(DebugVar));
-
-        // Первая переменная: s
-        uint64_t name_ptr_s = *(uint64_t*)p; p += 8;
-        uint32_t type_s = *(uint32_t*)p; p += 4;
-        int32_t offset_s = *(int32_t*)p; p += 4;
-
-        // Вторая переменная: c
-        uint64_t name_ptr_c = *(uint64_t*)p; p += 8;
-        uint32_t type_c = *(uint32_t*)p; p += 4;
-        int32_t offset_c = *(int32_t*)p; p += 4;
-
-        // Обработка первой переменной
-        if (sec_str) {
-            uint64_t name_rva = name_ptr_s - di->disk_image_base;
-            if (name_rva >= sec_str->VirtualAddress &&
-                name_rva < sec_str->VirtualAddress + sec_str->SizeOfRawData) {
-                uint64_t offset_in_section = name_rva - sec_str->VirtualAddress;
-                const char* name_str = (const char*)di->mapped_file +
-                                     sec_str->PointerToRawData + offset_in_section;
-                di->vars[0].name = name_str;
-            } else {
-                di->vars[0].name = "s";
-            }
-        } else {
-            di->vars[0].name = "s";
-        }
-        di->vars[0].type = type_s;
-        di->vars[0].rbp_offset = offset_s;
-
-        // Обработка второй переменной
-        if (sec_str) {
-            uint64_t name_rva = name_ptr_c - di->disk_image_base;
-            if (name_rva >= sec_str->VirtualAddress &&
-                name_rva < sec_str->VirtualAddress + sec_str->SizeOfRawData) {
-                uint64_t offset_in_section = name_rva - sec_str->VirtualAddress;
-                const char* name_str = (const char*)di->mapped_file +
-                                     sec_str->PointerToRawData + offset_in_section;
-                di->vars[1].name = name_str;
-            } else {
-                di->vars[1].name = "c";
-            }
-        } else {
-            di->vars[1].name = "c";
-        }
-        di->vars[1].type = type_c;
-        di->vars[1].rbp_offset = offset_c;
-
-        // Отладочный вывод
-        printf("DEBUG: Parsed variables:\n");
-        printf("  s: name='%s', type=%u, offset=%d\n",
-               di->vars[0].name, di->vars[0].type, di->vars[0].rbp_offset);
-        printf("  c: name='%s', type=%u, offset=%d\n",
-               di->vars[1].name, di->vars[1].type, di->vars[1].rbp_offset);
+    // Найдём RVA секции .text
+    text_rva = GetSectionRVA(exe, ".text");
+    if (text_rva == 0) {
+        printf("[-] Cannot find .text RVA\n");
+        return 1;
     }
 
-    return di;
+    // Загрузим имена переменных из .dbstr
+    ReadSection(exe, ".dbstr", (void**)&dbstr_data, (DWORD*)&dbstr_size);
 
-fail:
-    FreeDebugInfo(di);
-    return NULL;
+    // Прочитаем информацию о переменных
+    ParseDbInfo(exe);
+
+    // Покажем доступные строки и дадим выбрать
+    ParseDbLineAndList(exe);
+
+    return 0;
 }
 
-static void FreeDebugInfo(DebugInfo* di) {
-    if (!di) return;
-    if (di->mapped_file) UnmapViewOfFile(di->mapped_file);
-    if (di->hFileMap) CloseHandle(di->hFileMap);
-    if (di->hFile != INVALID_HANDLE_VALUE) CloseHandle(di->hFile);
-    free(di->lines);
-    free(di->vars);
-    free(di);
-}
+// =================================================
+//              Вспомогательные функции
+// =================================================
 
-static void ResolveRuntimeAddresses(DebugInfo* di, uint64_t runtime_base) {
-    for (size_t i = 0; i < di->num_lines; i++) {
-        uint64_t rva = di->lines[i].va_on_disk - di->disk_image_base;
-        di->lines[i].runtime_va = runtime_base + rva;
-    }
-}
+BOOL ReadSection(const char* filename, const char* name, void** data, DWORD* size) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) return FALSE;
 
-static BOOL SetBreakpoint(HANDLE hProcess, uint64_t va) {
-    BYTE old_byte;
-    SIZE_T bytes_read;
-    if (!ReadProcessMemory(hProcess, (LPCVOID)va, &old_byte, 1, &bytes_read))
-        return FALSE;
-    if (old_byte == 0xCC)
-        return TRUE;
-    BYTE int3 = 0xCC;
-    return WriteProcessMemory(hProcess, (LPVOID)va, &int3, 1, NULL);
-}
+    IMAGE_DOS_HEADER dos;
+    fread(&dos, sizeof(dos), 1, f);
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) { fclose(f); return FALSE; }
 
-static void ReadVariable(HANDLE hProcess, DebugInfo* di, const char* var_name, uint64_t rbp) {
-    DebugVar* v = NULL;
-    for (size_t i = 0; i < di->num_vars; i++) {
-        if (strcmp(di->vars[i].name, var_name) == 0) {
-            v = &di->vars[i];
-            break;
+    fseek(f, dos.e_lfanew, SEEK_SET);
+    IMAGE_NT_HEADERS64 nt;
+    fread(&nt, sizeof(nt), 1, f);
+    if (nt.Signature != IMAGE_NT_SIGNATURE) { fclose(f); return FALSE; }
+
+    for (int i = 0; i < nt.FileHeader.NumberOfSections; ++i) {
+        IMAGE_SECTION_HEADER sec;
+        fread(&sec, sizeof(sec), 1, f);
+        if (strncmp((char*)sec.Name, name, 8) == 0) {
+            *size = sec.SizeOfRawData ? sec.SizeOfRawData : sec.Misc.VirtualSize;
+            *data = malloc(*size);
+            fseek(f, sec.PointerToRawData, SEEK_SET);
+            fread(*data, 1, *size, f);
+            fclose(f);
+            return TRUE;
         }
     }
-    if (!v) {
-        printf("Unknown variable '%s'\n", var_name);
+    fclose(f);
+    return FALSE;
+}
+
+uint64_t GetSectionRVA(const char* filename, const char* name) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) return 0;
+
+    IMAGE_DOS_HEADER dos;
+    fread(&dos, sizeof(dos), 1, f);
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) { fclose(f); return 0; }
+
+    fseek(f, dos.e_lfanew, SEEK_SET);
+    IMAGE_NT_HEADERS64 nt;
+    fread(&nt, sizeof(nt), 1, f);
+    if (nt.Signature != IMAGE_NT_SIGNATURE) { fclose(f); return 0; }
+
+    for (int i = 0; i < nt.FileHeader.NumberOfSections; ++i) {
+        IMAGE_SECTION_HEADER sec;
+        fread(&sec, sizeof(sec), 1, f);
+        if (strncmp((char*)sec.Name, name, 8) == 0) {
+            fclose(f);
+            return sec.VirtualAddress;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+void ParseDbInfo(const char* filename) {
+    void* data; DWORD size;
+    if (!ReadSection(filename, ".dbinfo", &data, &size)) return;
+
+    uint8_t* p = (uint8_t*)data;
+    p += 8; // пропустить имя функции (8 байт)
+    uint32_t params = *(uint32_t*)p; p += 4;
+    num_locals = *(uint32_t*)p; p += 4;
+
+    if (num_locals > 10) num_locals = 10;
+
+    for (int i = 0; i < num_locals; ++i) {
+        uint64_t name_off = *(uint64_t*)p; p += 8;
+        locals[i].type = *(uint32_t*)p; p += 4;
+        locals[i].rbp_offset = *(int32_t*)p; p += 4;
+        locals[i].name = (dbstr_data && name_off < dbstr_size) ? (dbstr_data + name_off) : "unknown";
+    }
+
+    free(data);
+}
+
+void ParseDbLineAndList(const char* filename) {
+    void* data; DWORD size;
+    if (!ReadSection(filename, ".dbline", &data, &size)) {
+        printf("[-] No .dbline found\n");
         return;
     }
 
-    uint64_t addr = rbp + v->rbp_offset;
-    if (v->type == 0) { // int (32-bit)
-        int32_t val;
-        SIZE_T read;
-        if (ReadProcessMemory(hProcess, (LPCVOID)addr, &val, sizeof(val), &read)) {
-            printf("%s = %d\n", var_name, val);
-        } else {
-            printf("Failed to read %s\n", var_name);
-        }
-    } else if (v->type == 1) { // string
-        uint64_t ptr;
-        SIZE_T read;
-        if (ReadProcessMemory(hProcess, (LPCVOID)addr, &ptr, sizeof(ptr), &read)) {
-            if (ptr == 0) {
-                printf("%s = NULL\n", var_name);
-            } else {
-                char buf[256] = {0};
-                ReadProcessMemory(hProcess, (LPCVOID)ptr, buf, sizeof(buf) - 1, &read);
-                printf("%s = \"%s\"\n", var_name, buf);
-            }
-        } else {
-            printf("Failed to read pointer for %s\n", var_name);
-        }
-    }
-}
-
-static uint64_t FindNextLine(DebugInfo* di, uint64_t current_rip) {
-    uint64_t next_va = 0;
-    for (size_t i = 0; i < di->num_lines; i++) {
-        if (di->lines[i].runtime_va > current_rip) {
-            if (next_va == 0 || di->lines[i].runtime_va < next_va) {
-                next_va = di->lines[i].runtime_va;
-            }
-        }
-    }
-    return next_va;
-}
-
-// ========== MAIN ==========
-
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Usage: debugger <path_to_main.exe>\n");
-        return 1;
+    printf("\n=== Available breakpoints ===\n");
+    DbLineEntry* entries = (DbLineEntry*)data;
+    int count = 0;
+    while (entries[count].offset != 0 || entries[count].line != 0) {
+        uint64_t rva = text_rva + entries[count].offset;
+        printf("  %d: line %u (RVA 0x%llx)\n", count + 1, entries[count].line, rva);
+        count++;
     }
 
-    const char* target = argv[1];
-    DebugInfo* di = ParseDebugInfoFromFile(target);
-    if (!di) {
-        printf("Failed to parse debug info from %s\n", target);
-        return 1;
+    if (count == 0) {
+        printf("  No breakpoints available.\n");
+        free(data);
+        return;
     }
 
-    printf("[*] Parsed %zu debug lines\n", di->num_lines);
-    for (size_t i = 0; i < di->num_lines; i++) {
-        printf("  line %d @ 0x%llx (disk VA)\n", di->lines[i].line_number, (unsigned long long)di->lines[i].va_on_disk);
+    printf("\nChoose line number to break at (1-%d): ", count);
+    int choice;
+    if (scanf("%d", &choice) != 1 || choice < 1 || choice > count) {
+        printf("Invalid choice.\n");
+        free(data);
+        return;
     }
 
+    uint64_t target_rva = text_rva + entries[choice - 1].offset;
+    free(data);
+
+    // Запускаем процесс и отлаживаем
     STARTUPINFOA si = {0};
     PROCESS_INFORMATION pi = {0};
     si.cb = sizeof(si);
 
-    char cmd_line[MAX_PATH];
-    snprintf(cmd_line, sizeof(cmd_line), "\"%s\"", target);
-
-    if (!CreateProcessA(NULL, cmd_line, NULL, NULL, FALSE,
+    if (!CreateProcessA(filename, NULL, NULL, NULL, FALSE,
                         DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS,
                         NULL, NULL, &si, &pi)) {
-        printf("CreateProcess failed: %lu\n", GetLastError());
-        FreeDebugInfo(di);
-        return 1;
+        printf("CreateProcess failed\n");
+        return;
     }
 
-    printf("[*] Process started, PID=%lu\n", pi.dwProcessId);
+    hProcess = pi.hProcess;
+    hThread = pi.hThread;
+    image_base = (uint64_t) /* получим ниже */ 0;
 
-    uint64_t runtime_base = 0;
-    BOOL is_running = TRUE;
-    BOOL hit_initial_break = FALSE;
-    uint64_t current_rip = 0;
-    uint64_t current_rbp = 0;
+    // Запускаем отладочный цикл
+    DebugLoop(target_rva);
+}
 
+BOOL SetBreakpoint(uint64_t va) {
+    if (!ReadProcessMemory(hProcess, (void*)va, &original_byte, 1, NULL)) return FALSE;
+    BYTE int3 = 0xCC;
+    return WriteProcessMemory(hProcess, (void*)va, &int3, 1, NULL);
+}
+
+BOOL RemoveBreakpoint(uint64_t va) {
+    return WriteProcessMemory(hProcess, (void*)va, &original_byte, 1, NULL);
+}
+
+void DebugLoop(uint64_t target_rva) {
     DEBUG_EVENT de;
-    while (is_running) {
-        if (!WaitForDebugEvent(&de, INFINITE)) break;
+    BOOL hit = FALSE;
 
-        DWORD continue_status = DBG_CONTINUE;
-
-        switch (de.dwDebugEventCode) {
-            case CREATE_PROCESS_DEBUG_EVENT: {
-                runtime_base = (uint64_t)de.u.CreateProcessInfo.lpBaseOfImage;
-                printf("[*] Image loaded at 0x%llx\n", (unsigned long long)runtime_base);
-                ResolveRuntimeAddresses(di, runtime_base);
-                if (di->num_lines > 0) {
-                    SetBreakpoint(pi.hProcess, di->lines[0].runtime_va);
-                    printf("[*] Breakpoint set at line %d\n", di->lines[0].line_number);
-                }
-                CloseHandle(de.u.CreateProcessInfo.hFile);
+    while (WaitForDebugEvent(&de, INFINITE)) {
+        if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+            image_base = (uint64_t)de.u.CreateProcessInfo.lpBaseOfImage;
+            breakpoint_va = image_base + target_rva;
+            printf("\n[*] Process loaded. Image base = 0x%llx\n", image_base);
+            printf("[*] Setting breakpoint at VA = 0x%llx\n", breakpoint_va);
+            if (!SetBreakpoint(breakpoint_va)) {
+                printf("[-] Failed to set breakpoint\n");
                 break;
             }
-
-            case EXCEPTION_DEBUG_EVENT: {
-                DWORD code = de.u.Exception.ExceptionRecord.ExceptionCode;
-                uint64_t fault_addr = (uint64_t)de.u.Exception.ExceptionRecord.ExceptionAddress;
-
-                if (code == EXCEPTION_BREAKPOINT) {
-                    if (!hit_initial_break) {
-                        hit_initial_break = TRUE;
-                        break;
-                    }
-
-                    int current_line = -1;
-                    for (size_t i = 0; i < di->num_lines; i++) {
-                        if (di->lines[i].runtime_va == fault_addr) {
-                            current_line = di->lines[i].line_number;
-                            break;
-                        }
-                    }
-
-                    printf("\n>>> Stopped at line %d (0x%llx)\n", current_line, (unsigned long long)fault_addr);
-
-                    CONTEXT ctx = {0};
-                    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-                    if (GetThreadContext(pi.hThread, &ctx)) {
-                        current_rip = ctx.Rip;
-                        current_rbp = ctx.Rbp;
-                    }
-
-                    char cmd[256];
-                    while (1) {
-                        printf("(dbg) ");
-                        if (!fgets(cmd, sizeof(cmd), stdin)) break;
-                        cmd[strcspn(cmd, "\r\n")] = 0;
-
-                        if (strcmp(cmd, "quit") == 0) {
-                            is_running = FALSE;
-                            break;
-                        } else if (strcmp(cmd, "step") == 0) {
-                            uint64_t next = FindNextLine(di, fault_addr);
-                            if (next) {
-                                SetBreakpoint(pi.hProcess, next);
-                                printf("Stepping to next line...\n");
-                            } else {
-                                printf("No next line found.\n");
-                            }
-                            break;
-                        } else if (strncmp(cmd, "print ", 6) == 0) {
-                            char* var = cmd + 6;
-                            if (current_rbp) {
-                                ReadVariable(pi.hProcess, di, var, current_rbp);
-                            } else {
-                                printf("RBP not available\n");
-                            }
-                        } else if (strcmp(cmd, "regs") == 0) {
-                            printf("RIP=0x%llx, RBP=0x%llx\n", (unsigned long long)current_rip, (unsigned long long)current_rbp);
-                        } else {
-                            printf("Commands: step, print <var>, regs, quit\n");
-                        }
-                    }
-                } else {
-                    printf("Exception 0x%lx at 0x%p\n", code, de.u.Exception.ExceptionRecord.ExceptionAddress);
-                    is_running = FALSE;
-                }
-                break;
-            }
-
-            case EXIT_PROCESS_DEBUG_EVENT:
-                printf("\n[*] Process exited with code %lu\n", de.u.ExitProcess.dwExitCode);
-                is_running = FALSE;
-                break;
-
-            default:
-                break;
         }
 
-        if (!is_running) break;
-        ContinueDebugEvent(de.dwProcessId, de.dwThreadId, continue_status);
-    }
+        if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+            if (de.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT) {
+                CONTEXT ctx;
+                ctx.ContextFlags = CONTEXT_FULL;
+                if (GetThreadContext(hThread, &ctx)) {
+                    if (ctx.Rip == breakpoint_va + 1) { // после int3
+                        printf("\n[!] HIT BREAKPOINT\n");
+                        RemoveBreakpoint(breakpoint_va);
+                        ctx.Rip = breakpoint_va;
+                        SetThreadContext(hThread, &ctx);
 
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    FreeDebugInfo(di);
-    return 0;
+                        // Single-step
+                        ctx.ContextFlags = CONTEXT_FULL;
+                        ctx.EFlags |= 0x100;
+                        SetThreadContext(hThread, &ctx);
+                        hit = TRUE;
+                    } else if (hit && de.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+                        GetThreadContext(hThread, &ctx);
+                        uint64_t rbp = ctx.Rbp;
+
+                        printf("\n>>> Local variables:\n");
+                        for (int i = 0; i < num_locals; ++i) {
+                            if (locals[i].type == 0) { // int
+                                int val;
+                                if (ReadProcessMemory(hProcess, (void*)(rbp + locals[i].rbp_offset), &val, sizeof(val), NULL)) {
+                                    printf("    %s = %d\n", locals[i].name, val);
+                                }
+                            } else if (locals[i].type == 1) { // string
+                                char* ptr;
+                                if (ReadProcessMemory(hProcess, (void*)(rbp + locals[i].rbp_offset), &ptr, sizeof(ptr), NULL) && ptr) {
+                                    char buf[256] = {0};
+                                    if (ReadProcessMemory(hProcess, ptr, buf, sizeof(buf) - 1, NULL)) {
+                                        printf("    %s = \"%s\"\n", locals[i].name, buf);
+                                    }
+                                }
+                            }
+                        }
+
+                        printf("\n[!] Press Enter to continue execution...\n");
+                        getchar();
+                        hit = FALSE;
+                    }
+                }
+            }
+        }
+
+        if (de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+            printf("\n[*] Process exited (code: %lu)\n", de.u.ExitProcess.dwExitCode);
+            break;
+        }
+
+        ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+    }
 }
