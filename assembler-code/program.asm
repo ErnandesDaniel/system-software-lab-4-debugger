@@ -80,23 +80,27 @@ str_0 db 72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33, 46, 32, 69,
 str_1 db 37, 100, 0
 
 section .dbstr progbits alloc noexec readonly
+dbg_str_start:              ; Метка начала секции строк
 dbg_str_main db 'main', 0
-dbg_str_s db 's', 0
-dbg_str_c db 'c', 0
+dbg_str_s    db 's', 0
+dbg_str_c    db 'c', 0
 
 section .dbinfo progbits alloc noexec readonly
     ; === Функция main ===
-    dq dbg_str_main ; указатель на имя
+    ; Вычисляем смещение каждой строки от начала секции .dbstr
+    dq dbg_str_main - dbg_str_start ; смещение 0
     dd 0          ; params
     dd 2          ; locals
+
     ; Переменная s
-    dq dbg_str_s                    ; имя
+    dq dbg_str_s - dbg_str_start    ; теперь это будет число 5 (смещение)
     dd 1                            ; тип: string
-    dd -16                           ; смещение
+    dd -16                           ; ИСПРАВЛЕНО: в коде mov [rbp-8], rax
+
     ; Переменная c
-    dq dbg_str_c                    ; имя
+    dq dbg_str_c - dbg_str_start    ; теперь это число 7
     dd 0                            ; тип: int
-    dd -56                           ; смещение
+    dd -56                          ; смещение (совпадает с line_20)
 
 section .dbline progbits alloc noexec readonly
     dd line_16 - .text_start, 16
