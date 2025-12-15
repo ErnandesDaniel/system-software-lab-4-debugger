@@ -1,0 +1,10 @@
+def main () of int
+
+s = "Hello, World!. Enter some symbol"; //Присваиваем переменной строку
+
+c=10;
+
+return c;
+
+end
+

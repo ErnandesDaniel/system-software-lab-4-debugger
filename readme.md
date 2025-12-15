@@ -9,7 +9,7 @@ Working directory - рабочая директория (корень проек
 C:/Users/DN3672/CLionProjects/system-software-lab-3
 
 Скомпилировать главный файл в объектный файл windows можно через команду:
-nasm -f win64 program.asm -o program.obj
+nasm -f win64 -g program.asm -o program.obj
 
 Для линковки и получения исполняемого файла можно использовать:
 gcc program.obj -o program.exe

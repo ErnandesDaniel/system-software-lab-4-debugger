@@ -4,3 +4,5 @@ project(system_software_lab_4_debugger C)
 set(CMAKE_C_STANDARD 17)
 
 add_executable(system_software_lab_4_debugger main.c)
+
+target_link_libraries(system_software_lab_4_debugger dbghelp)
