@@ -3,15 +3,16 @@ default rel
 section .text
 
 global main
-global line_3    ; <--- ДОБАВИТЬ ЭТО
-global line_5    ; <--- ДОБАВИТЬ ЭТО
-global .dbinfo   ; <--- ДОБАВИТЬ ЭТО (чтобы найти адрес секции)
+global line_3
+global line_5
+global line_last
+global .dbinfo   ; <--- добавить это, чтобы найти адрес секции
 
 main:
     push rbp
     mov rbp, rsp
     sub rsp, 72
-main_start:; <-- Метка ПРЯМО ПЕРЕД первой полезной строкой
+main_start:; <-- Метка прямо перед первой полезной строкой
 BB_0:
     lea rax, [str_0]
     mov [rbp + -8], rax
@@ -24,6 +25,7 @@ line_5:
     mov eax, [rbp + -32]
     mov [rbp + -40], eax
     mov eax, [rbp + -40]
+line_last:
 ; Очистка стека и возврат
     leave       ; эквивалент: mov rsp, rbp; pop rbp
     ret         ; возвращаем eax как результат
@@ -57,4 +59,6 @@ section .dbline
     dd 3
     dq line_5
     dd 5
+    dq line_last
+    dd 6
     dq 0 ; Конец таблицы
