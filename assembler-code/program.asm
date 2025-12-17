@@ -56,9 +56,9 @@ section .dbinfo
 
 section .dbline
     dq line_3
-    dd 3
+    dq 3
     dq line_5
-    dd 5
+    dq 5
     dq line_last
-    dd 6
-    dq 0 ; Конец таблицы
+    dq 6
+    dq 0, 0 ; Конец таблицы

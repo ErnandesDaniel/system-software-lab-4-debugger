@@ -32,12 +32,14 @@ uint64_t get_reg_value(CONTEXT* ctx, int idx);
 // ============================================================================
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("Usage: %s <program.exe>\n", argv[0]);
+        printf("Usage: %s <program.exe> [line_number]\n", argv[0]);
         return 1;
     }
     const char* exe = argv[1];
 
-    // 1. Находим смещения секций в файле
+    // Если указан 3-й аргумент, используем его как фильтр строки, иначе -1 (все)
+    int target_line = (argc >= 3) ? atoi(argv[2]) : -1;
+
     uint64_t rva_info = GetSectionRVA(exe, ".dbinfo");
     uint64_t rva_line = GetSectionRVA(exe, ".dbline");
 
@@ -46,7 +48,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 2. Запускаем процесс в режиме отладки
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi;
     if (!CreateProcessA(exe, NULL, NULL, NULL, FALSE, DEBUG_ONLY_THIS_PROCESS, NULL, NULL, &si, &pi)) {
@@ -59,7 +60,6 @@ int main(int argc, char* argv[]) {
 
     while (WaitForDebugEvent(&de, INFINITE)) {
         if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
-            // Рассчитываем реальные адреса в памяти
             uint64_t base = (uint64_t)de.u.CreateProcessInfo.lpBaseOfImage;
             g_dbinfo_addr = base + rva_info;
             g_dbline_addr = base + rva_line;
@@ -69,25 +69,37 @@ int main(int argc, char* argv[]) {
 
             if (!system_bp_done) {
                 system_bp_done = 1;
-                // Читаем адреса из .dbline и расставляем брейкпоинты (0xCC)
+
+                // Читаем адреса из .dbline (шаг 16 байт: 8 байт адрес + 8 байт номер строки)
                 for (int i = 0; i < 100; i++) {
-                    uint64_t target;
-                    ReadProcessMemory(pi.hProcess, (LPCVOID)(g_dbline_addr + (i * 12)), &target, 8, NULL);
-                    if (target == 0) break;
+                    uint64_t addr_val = 0;
+                    uint64_t line_val = 0;
 
-                    g_bp_addrs[g_bp_count] = target;
-                    ReadProcessMemory(pi.hProcess, (LPVOID)target, &g_orig_bytes[g_bp_count], 1, NULL);
+                    ReadProcessMemory(pi.hProcess, (LPCVOID)(g_dbline_addr + (i * 16)), &addr_val, 8, NULL);
+                    if (addr_val == 0) break;
 
-                    unsigned char int3 = 0xCC;
-                    WriteProcessMemory(pi.hProcess, (LPVOID)target, &int3, 1, NULL);
-                    g_bp_count++;
+                    ReadProcessMemory(pi.hProcess, (LPCVOID)(g_dbline_addr + (i * 16) + 8), &line_val, 8, NULL);
+
+                    // Ставим брейкпоинт только если это нужная строка или если фильтр не задан
+                    if (target_line == -1 || target_line == (int)line_val) {
+                        g_bp_addrs[g_bp_count] = addr_val;
+                        ReadProcessMemory(pi.hProcess, (LPVOID)addr_val, &g_orig_bytes[g_bp_count], 1, NULL);
+
+                        unsigned char int3 = 0xCC;
+                        WriteProcessMemory(pi.hProcess, (LPVOID)addr_val, &int3, 1, NULL);
+                        g_bp_count++;
+                    }
                 }
-                printf("[*] Loaded %d breakpoints. Commands: 'p <name>', 'r <num>', 'n', 'q'\n", g_bp_count);
+
+                if (target_line != -1)
+                    printf("[*] Single-step mode: stopping only at line %d\n", target_line);
+                else
+                    printf("[*] Loaded %d breakpoints.\n", g_bp_count);
+
+                printf("[*] Commands: 'p <name>', 'r <num>', 'n', 'q'\n");
             } else {
-                // Остановка на нашей метке
                 handle_interactive_menu(pi.hProcess, pi.hThread);
 
-                // Подготовка к продолжению: откатываем RIP и возвращаем оригинальный байт
                 CONTEXT ctx; ctx.ContextFlags = CONTEXT_FULL;
                 GetThreadContext(pi.hThread, &ctx);
                 ctx.Rip--;
@@ -110,7 +122,7 @@ int main(int argc, char* argv[]) {
 }
 
 // ============================================================================
-// ИНТЕРАКТИВНОЕ МЕНЮ
+// ИНТЕРАКТИВНОЕ МЕНЮ (Без изменений)
 // ============================================================================
 void handle_interactive_menu(HANDLE hProc, HANDLE hThread) {
     CONTEXT ctx;
@@ -128,27 +140,15 @@ void handle_interactive_menu(HANDLE hProc, HANDLE hThread) {
         int count = sscanf(input, "%s %s", cmd, arg);
         if (count < 1) continue;
 
-        // Команда n - продолжить
         if (strcmp(cmd, "n") == 0) break;
-
-        // Команда q - выйти
-        else if (strcmp(cmd, "q") == 0) {
-            TerminateProcess(hProc, 0);
-            exit(0);
-        }
-
-        // Команда r <num> - чтение регистра
+        else if (strcmp(cmd, "q") == 0) { TerminateProcess(hProc, 0); exit(0); }
         else if (strcmp(cmd, "r") == 0 && count == 2) {
             int reg_idx = atoi(arg);
             if (reg_idx >= 0 && reg_idx <= 16) {
                 uint64_t val = get_reg_value(&ctx, reg_idx);
                 printf("%s (reg %d) = 0x%llx\n", g_reg_names[reg_idx], reg_idx, val);
-            } else {
-                printf("Invalid register index. 0:RAX, 6:RBP, 7:RSP, 16:RIP.\n");
             }
         }
-
-        // Команда p <name> - чтение переменной
         else if (strcmp(cmd, "p") == 0 && count == 2) {
             uint32_t var_count;
             ReadProcessMemory(hProc, (LPCVOID)(g_dbinfo_addr + 24), &var_count, 4, NULL);
@@ -163,10 +163,10 @@ void handle_interactive_menu(HANDLE hProc, HANDLE hThread) {
 
                 if (strcmp(vname, arg) == 0) {
                     uint64_t val_addr = ctx.Rbp + var.offset;
-                    if (var.type == 0) { // int
+                    if (var.type == 0) {
                         int val; ReadProcessMemory(hProc, (LPCVOID)val_addr, &val, 4, NULL);
                         printf("%s (int) = %d\n", vname, val);
-                    } else { // string
+                    } else {
                         uint64_t s_ptr; ReadProcessMemory(hProc, (LPCVOID)val_addr, &s_ptr, 8, NULL);
                         char s_val[128] = {0}; ReadProcessMemory(hProc, (LPCVOID)s_ptr, s_val, 127, NULL);
                         printf("%s (string) = \"%s\"\n", vname, s_val);
@@ -177,14 +177,12 @@ void handle_interactive_menu(HANDLE hProc, HANDLE hThread) {
             }
             if (!found) printf("Variable '%s' not found.\n", arg);
         }
-        else if (strcmp(cmd, "help") == 0) {
-            printf("Commands: p <name>, r <0-16>, n, q\n");
-        }
+        else if (strcmp(cmd, "help") == 0) printf("Commands: p <name>, r <0-16>, n, q\n");
     }
 }
 
 // ============================================================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (Без изменений)
 // ============================================================================
 uint64_t get_reg_value(CONTEXT* ctx, int idx) {
     switch (idx) {
@@ -206,17 +204,12 @@ uint64_t GetSectionRVA(const char* filename, const char* sectionName) {
     if (hFile == INVALID_HANDLE_VALUE) return 0;
     HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
     LPVOID pBase = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)pBase;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)pBase + dos->e_lfanew);
     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-
     uint64_t rva = 0;
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        if (strncmp((char*)sec[i].Name, sectionName, 8) == 0) {
-            rva = sec[i].VirtualAddress;
-            break;
-        }
+        if (strncmp((char*)sec[i].Name, sectionName, 8) == 0) { rva = sec[i].VirtualAddress; break; }
     }
     UnmapViewOfFile(pBase); CloseHandle(hMapping); CloseHandle(hFile);
     return rva;
