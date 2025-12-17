@@ -1,3 +1,17 @@
+Изменение компилятора CLion:
+
+Нажмите Ctrl + Alt + S (Settings).
+
+Перейдите в Build, Execution, Deployment -> Toolchains.
+
+Нажмите кнопку + и выберите Visual Studio.
+
+Дождитесь, пока CLion определит пути (у вас должен быть установлен Visual Studio или Build Tools).
+
+Важно: Перетащите "Visual Studio" в самый верх списка, чтобы сделать его основным.
+
+Нажмите OK и пересоберите проект (Build -> Rebuild Project).
+
 Настройка CLion:
 
 Edit Configurations
