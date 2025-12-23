@@ -30,12 +30,12 @@ square_before_ret:
     ret         ; возвращаем eax как результат
 square_end:
 
-section .debug_str
+section .dbstr
 dbg_str_square db 'square', 0
 dbg_str_x db 'x', 0
 dbg_str_b db 'b', 0
 
-section .debug_info
+section .dbinfo
     ; === Функция square ===
     dq dbg_str_square                 ; указатель на имя
     dq square_start                   ; Реальный адрес начала кода (для отладчика)
@@ -50,7 +50,7 @@ section .debug_info
     dd 0                            ; тип: int
     dd -24                           ; смещение
 
-section .debug_line
+section .dbline
 dq line_5
 dq 5
 dq square_before_ret

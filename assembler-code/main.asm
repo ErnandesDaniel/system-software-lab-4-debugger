@@ -47,13 +47,13 @@ main_end:
 section .rodata
 str_0 db 72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33, 46, 32, 69, 110, 116, 101, 114, 32, 115, 111, 109, 101, 32, 115, 121, 109, 98, 111, 108, 0
 
-section .debug_str
+section .dbstr
 dbg_str_main db 'main', 0
 dbg_str_s db 's', 0
 dbg_str_c db 'c', 0
 dbg_str_b db 'b', 0
 
-section .debug_info
+section .dbinfo
     ; === Функция main ===
     dq dbg_str_main                 ; указатель на имя
     dq main_start                   ; Реальный адрес начала кода (для отладчика)
@@ -72,7 +72,7 @@ section .debug_info
     dd 0                            ; тип: int
     dd -72                           ; смещение
 
-section .debug_line
+section .dbline
 dq line_12
 dq 12
 dq line_14

@@ -1,10 +1,21 @@
+
+
+//Умножить два числа
+def square(x of int) of int
+    b=6;
+    return x * x;
+end
+
+
 def main () of int
 
 s = "Hello, World!. Enter some symbol"; //Присваиваем переменной строку
 
 c=10;
 
-return c;
+b=square(3);
+
+return b;
 
 end
 
