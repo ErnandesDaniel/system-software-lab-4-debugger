@@ -11,19 +11,20 @@ global .dbinfo
 square:
     push rbp
     mov rbp, rsp
+    mov [rbp + -8], rcx
     sub rsp, 72
 square_start:
 BB_0:
     mov eax, 6
-    mov [rbp + -16], eax
+    mov [rbp + -40], eax
 line_5:
-    mov eax, [rbp + -16]
-    mov [rbp + -24], eax
-    mov eax, ecx
-    mov ebx, ecx
+    mov eax, [rbp + -40]
+    mov [rbp + -48], eax
+    mov eax, [rbp + -8]
+    mov ebx, [rbp + -8]
     imul eax, ebx
-    mov [rbp + -56], eax
-    mov eax, [rbp + -56]
+    mov [rbp + -64], eax
+    mov eax, [rbp + -64]
 square_before_ret:
 ; Очистка стека и возврат
     leave       ; эквивалент: mov rsp, rbp; pop rbp
@@ -50,7 +51,7 @@ section .dbinfo
     ; Переменная b
     dq dbg_str_b                    ; имя
     dd 0                            ; тип: int
-    dd -24                           ; смещение
+    dd -48                           ; смещение
     align 16                    ; Конец секции в этом файле
 
 section .dbline

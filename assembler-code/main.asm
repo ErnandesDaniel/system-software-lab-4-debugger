@@ -14,30 +14,30 @@ extern square
 main:
     push rbp
     mov rbp, rsp
-    sub rsp, 104
+    sub rsp, 136
 main_start:
 BB_0:
     lea rax, [str_0]
-    mov [rbp + -8], rax
+    mov [rbp + -40], rax
 line_12:
-    mov rax, [rbp + -8]
-    mov [rbp + -16], rax
+    mov rax, [rbp + -40]
+    mov [rbp + -48], rax
     mov eax, 10
-    mov [rbp + -32], eax
+    mov [rbp + -64], eax
 line_14:
-    mov eax, [rbp + -32]
-    mov [rbp + -40], eax
+    mov eax, [rbp + -64]
+    mov [rbp + -72], eax
     mov eax, 3
-    mov [rbp + -56], eax
+    mov [rbp + -88], eax
 line_16:
-    mov ecx, [rbp + -56]
+    mov ecx, [rbp + -88]
     sub rsp, 32
     call square
     add rsp, 32
-    mov [rbp + -64], eax
-    mov eax, [rbp + -64]
-    mov [rbp + -72], eax
-    mov eax, [rbp + -72]
+    mov [rbp + -96], eax
+    mov eax, [rbp + -96]
+    mov [rbp + -104], eax
+    mov eax, [rbp + -104]
 main_before_ret:
 ; Очистка стека и возврат
     leave       ; эквивалент: mov rsp, rbp; pop rbp
@@ -64,15 +64,15 @@ section .dbinfo
     ; Переменная s
     dq dbg_str_s                    ; имя
     dd 1                            ; тип: string
-    dd -16                           ; смещение
+    dd -48                           ; смещение
     ; Переменная c
     dq dbg_str_c                    ; имя
     dd 0                            ; тип: int
-    dd -40                           ; смещение
+    dd -72                           ; смещение
     ; Переменная b
     dq dbg_str_b                    ; имя
     dd 0                            ; тип: int
-    dd -72                           ; смещение
+    dd -104                           ; смещение
     align 16                    ; Конец секции в этом файле
 
 section .dbline
