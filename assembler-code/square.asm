@@ -36,11 +36,13 @@ dbg_str_x db 'x', 0
 dbg_str_b db 'b', 0
 
 section .dbinfo
+    align 16                    ; Гарантируем начало структуры на границе 16 байт
     ; === Функция square ===
     dq dbg_str_square                 ; указатель на имя
     dq square_start                   ; Реальный адрес начала кода (для отладчика)
     dq square_end                     ; конец
     dd 2                         ; локальных: 2
+    dd 0
     ; Переменная x
     dq dbg_str_x                    ; имя
     dd 0                            ; тип: int
@@ -49,10 +51,14 @@ section .dbinfo
     dq dbg_str_b                    ; имя
     dd 0                            ; тип: int
     dd -24                           ; смещение
+    align 16                    ; Конец секции в этом файле
 
 section .dbline
+align 16                    ; Начало блока строк
+dq square_start       ; Указываем, чьи это строки
+dq 2                ; Сколько строк в этом блоке
 dq line_5
 dq 5
 dq square_before_ret
 dq 6
-dq 0, 0 ; Конец таблицы
+align 16

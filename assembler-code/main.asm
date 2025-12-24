@@ -54,11 +54,13 @@ dbg_str_c db 'c', 0
 dbg_str_b db 'b', 0
 
 section .dbinfo
+    align 16                    ; Гарантируем начало структуры на границе 16 байт
     ; === Функция main ===
     dq dbg_str_main                 ; указатель на имя
     dq main_start                   ; Реальный адрес начала кода (для отладчика)
     dq main_end                     ; конец
     dd 3                         ; локальных: 3
+    dd 0
     ; Переменная s
     dq dbg_str_s                    ; имя
     dd 1                            ; тип: string
@@ -71,8 +73,12 @@ section .dbinfo
     dq dbg_str_b                    ; имя
     dd 0                            ; тип: int
     dd -72                           ; смещение
+    align 16                    ; Конец секции в этом файле
 
 section .dbline
+align 16                    ; Начало блока строк
+dq main_start       ; Указываем, чьи это строки
+dq 4                ; Сколько строк в этом блоке
 dq line_12
 dq 12
 dq line_14
@@ -81,4 +87,4 @@ dq line_16
 dq 16
 dq main_before_ret
 dq 17
-dq 0, 0 ; Конец таблицы
+align 16

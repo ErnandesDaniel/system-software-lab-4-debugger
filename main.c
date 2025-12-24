@@ -97,15 +97,44 @@ int main(int argc, char* argv[]) {
 const char* find_func_name(HANDLE hProc, uint64_t addr) {
     static char name_buf[64];
     uint64_t ptr = g_dbinfo_addr;
-    while (1) {
+
+    printf(CLR_HEADER "\n[v] Поиск функции для RIP: 0x%llx\n" CLR_RESET, addr);
+
+    for (int i = 0; i < 20; i++) { // Ограничим 20 записями для теста
         FuncEntry f;
-        if (!ReadProcessMemory(hProc, (LPCVOID)ptr, &f, sizeof(f), NULL) || f.func_name_ptr == 0) break;
+        if (!ReadProcessMemory(hProc, (LPCVOID)ptr, &f, sizeof(f), NULL)) {
+            printf(CLR_ERR "[-] Не удалось прочитать память по адресу 0x%llx\n" CLR_RESET, ptr);
+            break;
+        }
+
+        // Если встретили нули (выравнивание линковщика)
+        if (f.func_name_ptr == 0) {
+            printf("  [?] Смещение 0x%llx: Нулевой указатель (пропуск 8 байт)\n", ptr);
+            ptr += 8;
+            continue;
+        }
+
+        // Читаем имя функции для вывода
+        char current_f_name[64] = {0};
+        ReadProcessMemory(hProc, (LPCVOID)f.func_name_ptr, current_f_name, 63, NULL);
+
+        printf("  [+] Проверка: " CLR_FUNC "%s" CLR_RESET "\n", current_f_name);
+        printf("      Диапазон: 0x%llx - 0x%llx\n", f.start_addr, f.end_addr);
+
         if (addr >= f.start_addr && addr <= f.end_addr) {
-            ReadProcessMemory(hProc, (LPCVOID)f.func_name_ptr, name_buf, 63, NULL);
+            printf(CLR_HEADER "      [!] Найдено совпадение!\n" CLR_RESET);
+            strcpy(name_buf, current_f_name);
             return name_buf;
         }
-        ptr += sizeof(f) + (f.var_count * sizeof(VarEntry));
+
+        // Рассчитываем адрес следующей функции:
+        // Текущий адрес + размер заголовка + (количество переменных * размер одной записи переменной)
+        uint64_t next_ptr = ptr + sizeof(f) + (f.var_count * sizeof(VarEntry));
+        printf("      Переменных: %d, смещаемся к 0x%llx\n", f.var_count, next_ptr);
+
+        ptr = next_ptr;
     }
+
     return "unknown_func";
 }
 
